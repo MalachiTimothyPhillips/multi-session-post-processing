@@ -1,3 +1,4 @@
 *.cache
 *.log
 run.sh
+*0.f0*

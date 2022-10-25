@@ -116,8 +116,41 @@ void UDF_ExecuteStep(nrs_t *nrs, dfloat time, int tstep)
       o_z0,
       mesh->o_U);
 
-  if (nrs->isOutputStep) {
-    nek::ocopyToNek(time, tstep);
-    nek::userchk();
+  static bool firstSend = true;
+  bool send = tstep > 10;
+  if (send && firstSend) {
+    firstSend = false;
+    // communicate simulation results with coupled session, if applicable
+    [&](){
+      if(!nrs->multiSession) return;
+      if(platform->comm.mpiCommSize > 1) return;
+      nrs->o_U.copyTo(nrs->U);
+
+      // field offsets may differ between the simulations, so must ensure
+      // that buffer is appropriately sized
+      std::vector<dfloat> U(nrs->NVfields * mesh->Nlocal);
+      for(int i = 0; i < mesh->Nlocal; ++i){
+        U[i + 0 * mesh->Nlocal] = nrs->U[i + 0 * nrs->fieldOffset];
+        U[i + 1 * mesh->Nlocal] = nrs->U[i + 1 * nrs->fieldOffset];
+        U[i + 2 * mesh->Nlocal] = nrs->U[i + 2 * nrs->fieldOffset];
+      }
+      
+      // send to the other rank
+      int globRank;
+      MPI_Comm_rank(platform->comm.mpiCommParent, &globRank);
+      int otherRank = (globRank + 1) % 2;
+
+      MPI_Request request;
+      MPI_Isend((void*) U.data(),
+        U.size() * sizeof(dfloat),
+        MPI_UNSIGNED_CHAR, 
+        otherRank,
+        0,
+        platform->comm.mpiCommParent,
+        &request);
+      
+      MPI_Wait(&request, MPI_STATUS_IGNORE);
+
+    }();
   }
 }

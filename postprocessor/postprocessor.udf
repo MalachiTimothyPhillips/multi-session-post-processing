@@ -4,7 +4,6 @@
 
 #include <math.h>
 #include "udf.hpp"
-
 #include <vector>
 
 static dfloat P_U0;
@@ -17,45 +16,8 @@ static dfloat P_D0;
 static dfloat P_OMEGA;
 static dfloat P_AMP;
 
-occa::kernel dpdxKernel; 
-occa::kernel exactUVWPKernel; 
-occa::kernel userMeshVelocityKernel;
-occa::memory o_x0, o_y0, o_z0;
-
-void userq(nrs_t *nrs, dfloat time, occa::memory o_S, occa::memory o_FS)
-{
-  mesh_t *mesh = nrs->meshV; 
-  cds_t *cds   = nrs->cds; 
-  const dlong Nlocal = nrs->meshV->Nelements * nrs->meshV->Np;
-
-  dpdxKernel(Nlocal, time, mesh->o_x, mesh->o_y, mesh->o_z, 0*cds->fieldOffset[0], o_FS);
-  dpdxKernel(Nlocal, time, mesh->o_x, mesh->o_y, mesh->o_z, 1*cds->fieldOffset[0], o_FS);
-}                                                   
-
 void UDF_LoadKernels(occa::properties& kernelInfo)
 {
-  // called from all ranks, so MPI collectives are O.K.
-  int maxRank = platform->comm.mpiRank;
-  MPI_Allreduce(MPI_IN_PLACE, &maxRank, 1, MPI_INT, MPI_MAX, platform->comm.mpiComm);
-
-  setupAide &options = platform->options;
-
-  dfloat mue, rho;
-  options.getArgs("VISCOSITY", mue);
-  options.getArgs("DENSITY", rho); 
-  kernelInfo["defines/p_nu"] = mue/rho;
-  kernelInfo["defines/p_U0"] = P_U0;
-  kernelInfo["defines/p_V0"] = P_V0;
-  kernelInfo["defines/p_W0"] = P_W0;
-  kernelInfo["defines/p_A"]  = P_A0 * M_PI;
-  kernelInfo["defines/p_D"]  = P_D0 * M_PI;
-  kernelInfo["defines/p_amp"] = P_AMP;
-  kernelInfo["defines/p_omega"] = P_OMEGA;
-  kernelInfo["defines/p_pi"] = M_PI;
-
-  dpdxKernel = oudfBuildKernel(kernelInfo, "dpdx");
-  exactUVWPKernel = oudfBuildKernel(kernelInfo, "exactUVWP"); 
-  userMeshVelocityKernel = oudfBuildKernel(kernelInfo, "userMeshVelocity");
 }
 
 void UDF_Setup0(MPI_Comm comm, setupAide &options)
@@ -82,42 +44,53 @@ void UDF_Setup0(MPI_Comm comm, setupAide &options)
 
 void UDF_Setup(nrs_t *nrs)
 {
-  mesh_t *mesh = nrs->meshV;
-  udf.sEqnSource = &userq;
-  if(platform->options.compareArgs("MOVING MESH", std::string("TRUE"))) {
-    o_x0 = platform->device.malloc(mesh->Nlocal, sizeof(dfloat), mesh->o_x);
-    o_y0 = platform->device.malloc(mesh->Nlocal, sizeof(dfloat), mesh->o_y);
-    o_z0 = platform->device.malloc(mesh->Nlocal, sizeof(dfloat), mesh->o_z);
-  }
 }
 
 void UDF_ExecuteStep(nrs_t *nrs, dfloat time, int tstep)
 {
-  mesh_t *mesh = nrs->meshV;
-  cds_t *cds = nrs->cds;
+  static bool first = true;
+  if(!first) return;
 
-  if (tstep <= 5) {
-    exactUVWPKernel(mesh->Nlocal, time, mesh->o_x, mesh->o_y, mesh->o_z, nrs->fieldOffset, nrs->o_P, nrs->o_U);
-    if (nrs->pSolver) 
-      ellipticZeroMean(nrs->pSolver, nrs->o_P);
-    if (nrs->Nscalar > 0) 
-      cds->o_S.copyFrom(nrs->o_U, mesh->Nlocal*sizeof(dfloat), 0*cds->fieldOffset[0]*sizeof(dfloat));
-    if (nrs->Nscalar > 1) 
-    cds->o_S.copyFrom(nrs->o_U, mesh->Nlocal*sizeof(dfloat), 1*cds->fieldOffset[0]*sizeof(dfloat));
+  first = false;
+  auto * mesh = nrs->meshV;
+
+  // send to the other rank
+  int globRank;
+  MPI_Comm_rank(platform->comm.mpiCommParent, &globRank);
+  int otherRank = (globRank + 1) % 2;
+
+  std::vector<dfloat> U(nrs->NVfields * mesh->Nlocal);
+
+  MPI_Request request;
+  MPI_Irecv((void*) U.data(),
+    U.size() * sizeof(dfloat),
+    MPI_UNSIGNED_CHAR, 
+    otherRank,
+    MPI_ANY_TAG,
+    platform->comm.mpiCommParent,
+    &request);
+  
+  // do whatever postprocessing can be done here before receiving the data
+  MPI_Wait(&request, MPI_STATUS_IGNORE);
+
+  for(int i = 0; i < mesh->Nlocal; ++i){
+    nrs->U[i + 0 * nrs->fieldOffset] = U[i + 0 * mesh->Nlocal];
+    nrs->U[i + 1 * nrs->fieldOffset] = U[i + 1 * mesh->Nlocal];
+    nrs->U[i + 2 * nrs->fieldOffset] = U[i + 2 * mesh->Nlocal];
   }
 
-  if(platform->options.compareArgs("MOVING MESH", std::string("TRUE")))
-    userMeshVelocityKernel(
-      mesh->Nlocal,
-      nrs->fieldOffset,
-      time,
-      o_x0,
-      o_y0,
-      o_z0,
-      mesh->o_U);
+  nrs->o_U.copyFrom(nrs->U);
 
-  if (nrs->isOutputStep) {
-    nek::ocopyToNek(time, tstep);
-    nek::userchk();
-  }
+  nek::ocopyToNek(time, tstep);
+  nek::userchk();
+
+  // tell other rank to go ahead
+  char nothing;
+  MPI_Send((void*) &nothing,
+    sizeof(char),
+    MPI_UNSIGNED_CHAR, 
+    otherRank,
+    0,
+    platform->comm.mpiCommParent);
+
 }
