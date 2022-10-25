@@ -3,10 +3,9 @@
 polynomialOrder = 9
 #startFrom = "restart.fld"
 stopAt = numSteps
-numSteps = 100 
+numSteps = 1
 dt = 2e-03
 timeStepper = tombo3
-writeControl = simulationTime 
 writeInterval = 0.1
 
 [PRESSURE]

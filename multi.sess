@@ -1,2 +1,2 @@
-1:runner/runner
-1:postprocessor/runner
+runner/runner:1;
+postprocessor/postprocessor:1;
