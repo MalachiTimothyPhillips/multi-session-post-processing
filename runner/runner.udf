@@ -152,7 +152,7 @@ void UDF_Setup(nrs_t *nrs)
     globalElements[eg] = parentRank;
   }
 
-  MPI_Reduce(MPI_IN_PLACE, globalElements.data(), numGlobalElements, MPI_DLONG, MPI_MAX, 0, platform->comm.mpiComm);
+  MPI_Allreduce(MPI_IN_PLACE, globalElements.data(), numGlobalElements, MPI_DLONG, MPI_MAX, platform->comm.mpiComm);
 
   // send to other session
   MPI_Bcast(globalElements.data(), numGlobalElements, MPI_DLONG, rootSending, platform->comm.mpiCommParent);
@@ -182,10 +182,11 @@ void packBuf(nrs_t* nrs)
     auto eStart = bufferStart.at(rank);
     auto start = numFields * mesh->Np * eStart;
     const auto nElem = elements.size();
+    int ctr = 0;
     for(auto&& e : elements){
       for(int n = 0; n < mesh->Np; ++n){
         const auto id = e * mesh->Np + n;
-        const auto iid = (e - eStart) * mesh->Np + n;
+        const auto iid = ctr * mesh->Np + n;
         buffer[start + iid + 0 * nElem * mesh->Np] = nrs->U[id + 0 * nrs->fieldOffset];
         buffer[start + iid + 1 * nElem * mesh->Np] = nrs->U[id + 1 * nrs->fieldOffset];
         buffer[start + iid + 2 * nElem * mesh->Np] = nrs->U[id + 2 * nrs->fieldOffset];
@@ -196,6 +197,7 @@ void packBuf(nrs_t* nrs)
           }
         }
       }
+      ctr++;
     }
   }
 }

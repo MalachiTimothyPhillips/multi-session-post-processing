@@ -97,7 +97,7 @@ void UDF_Setup(nrs_t *nrs)
     globalElements[ge] = parentRank;
   }
 
-  MPI_Reduce(MPI_IN_PLACE, globalElements.data(), numGlobalElements, MPI_DLONG, MPI_MAX, 0, platform->comm.mpiComm);
+  MPI_Allreduce(MPI_IN_PLACE, globalElements.data(), numGlobalElements, MPI_DLONG, MPI_MAX, platform->comm.mpiComm);
 
   // share with other session
   MPI_Bcast(globalElements.data(), numGlobalElements, MPI_DLONG, rootReceiving, platform->comm.mpiCommParent);
@@ -159,10 +159,11 @@ void unpackBuf(nrs_t* nrs)
     auto eStart = bufferStart.at(rank);
     auto start = numFields * mesh->Np * eStart;
     const auto nElem = elements.size();
-    for(auto&& e : elements){
+    int ctr = 0;
+    for(auto&& e : elements){ // TODO: non-uniform strided access -- how to handle this term?
       for(int n = 0; n < mesh->Np; ++n){
         const auto id = e * mesh->Np + n;
-        const auto iid = (e-eStart) * mesh->Np + n;
+        const auto iid = ctr * mesh->Np + n;
         nrs->U[id + 0 * nrs->fieldOffset] = buffer[start + iid + 0 * nElem * mesh->Np];
         nrs->U[id + 1 * nrs->fieldOffset] = buffer[start + iid + 1 * nElem * mesh->Np];
         nrs->U[id + 2 * nrs->fieldOffset] = buffer[start + iid + 2 * nElem * mesh->Np];
@@ -173,6 +174,7 @@ void unpackBuf(nrs_t* nrs)
           }
         }
       }
+      ctr++;
     }
   }
 }
