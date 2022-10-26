@@ -160,7 +160,7 @@ void unpackBuf(nrs_t* nrs)
     auto start = numFields * mesh->Np * eStart;
     const auto nElem = elements.size();
     int ctr = 0;
-    for(auto&& e : elements){ // TODO: non-uniform strided access -- how to handle this term?
+    for(auto&& e : elements){
       for(int n = 0; n < mesh->Np; ++n){
         const auto id = e * mesh->Np + n;
         const auto iid = ctr * mesh->Np + n;
