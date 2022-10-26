@@ -3,7 +3,7 @@
 polynomialOrder = 9
 #startFrom = "restart.fld"
 stopAt = numSteps
-numSteps = 20
+numSteps = 100
 dt = 2e-03
 timeStepper = tombo3
 

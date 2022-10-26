@@ -22,7 +22,9 @@ static std::map<dlong, dlong> bufferStart; // in terms of elements
 static std::vector<MPI_Request> requests;
 static MPI_Comm sendingCommunicator;
 static std::vector<dfloat> buffer;
-static dfloat numFields;
+static dlong numFields;
+static dlong rootReceiving;
+static dlong rootSending;
 
 void UDF_LoadKernels(occa::properties& kernelInfo)
 {
@@ -59,8 +61,8 @@ void UDF_Setup(nrs_t *nrs)
   MPI_Group receivingGroup; // group associated with my communicator
 
   int rootParent = 0;
-  int rootSending = -1; // relative to parent
-  int rootReceiving = -1; // relative to parent
+  rootSending = -1; // relative to parent
+  rootReceiving = -1; // relative to parent
 
   int parentRank;
   MPI_Comm_rank(platform->comm.mpiCommParent, &parentRank);
@@ -92,7 +94,7 @@ void UDF_Setup(nrs_t *nrs)
     auto ge = nek::lglel(e);
     myGlobalElements[e] = ge;
     globalToLocal[ge] = e;
-    globalElement[ge] = parentRank;
+    globalElements[ge] = parentRank;
   }
 
   MPI_Reduce(MPI_IN_PLACE, globalElements.data(), numGlobalElements, MPI_DLONG, MPI_MAX, 0, platform->comm.mpiComm);
@@ -110,15 +112,17 @@ void UDF_Setup(nrs_t *nrs)
   }
 
   // determine the starting index for each rank
-  dlong bufferStart = 0;
+  dlong start = 0;
   for(auto&& [rank, elements] : sendingRankToElements){
-    bufferStart[rank] = bufferStart;
-    bufferStart += elements.size();
+    bufferStart[rank] = start;
+    start += elements.size();
   }
 
-  numFields = nrs->NVfields nrs->Nscalar + 1; // velocity, pressure, and scalars
+  numFields = nrs->NVfields + nrs->Nscalar + 1; // velocity, pressure, and scalars
+  std::cout << "numFields = " << numFields << "\n";
 
-  buffer.resize(bufferStart*mesh->Np*numFields);
+  buffer.resize(start*mesh->Np*numFields);
+  requests.resize(sendingRankToElements.size());
 
   
   if(platform->comm.mpiRank == 0){
@@ -135,16 +139,18 @@ void recvBuf(nrs_t* nrs)
 
   size_t ctr = 0;
   for(auto&& [rank, elements] : sendingRankToElements){
-    auto start = numFields * mesh->Np * bufferStart[rank];
+    std::cout << "Calling recv from " << parentRank << " for sender " << rank << "\n";
+    auto start = numFields * mesh->Np * bufferStart.at(rank);
     auto count = numFields * mesh->Np * elements.size();
-    MPI_Isend(
-      (void*)(buffer.data() + start),
+    MPI_Irecv(
+      (void*)(&buffer[start]),
       count * sizeof(dfloat),
       MPI_UNSIGNED_CHAR,
       rank,
       rank, // tag is sending rank
       platform->comm.mpiCommParent,
-      &requests[ctr++]);
+      &requests[ctr]);
+    ctr++;
   }
 }
 
@@ -152,18 +158,22 @@ void unpackBuf(nrs_t* nrs)
 {
   auto * mesh = nrs->meshV;
   for(auto&& [rank, elements] : sendingRankToElements){
-    auto start = numFields * mesh->Np * bufferStart[rank];
+    auto eStart = bufferStart.at(rank);
+    auto start = numFields * mesh->Np * eStart;
+    //std::cout << "start = " << start << "\n";
     const auto nElem = elements.size();
     for(auto&& e : elements){
+      //std::cout << "e = " << e << "\n";
       for(int n = 0; n < mesh->Np; ++n){
         const auto id = e * mesh->Np + n;
-        nrs->U[id + 0 * nrs->fieldOffset] = buffer[start + n + 0 * nElem * mesh->Np];
-        nrs->U[id + 1 * nrs->fieldOffset] = buffer[start + n + 1 * nElem * mesh->Np];
-        nrs->U[id + 2 * nrs->fieldOffset] = buffer[start + n + 2 * nElem * mesh->Np];
-        nrs->P[id]                        = buffer[start + n + 3 * nElem * mesh->Np];
+        const auto iid = (e-eStart) * mesh->Np + n;
+        nrs->U[id + 0 * nrs->fieldOffset] = buffer[start + iid + 0 * nElem * mesh->Np];
+        nrs->U[id + 1 * nrs->fieldOffset] = buffer[start + iid + 1 * nElem * mesh->Np];
+        nrs->U[id + 2 * nrs->fieldOffset] = buffer[start + iid + 2 * nElem * mesh->Np];
+        nrs->P[id]                        = buffer[start + iid + 3 * nElem * mesh->Np];
         if(nrs->cds){
           for(int is = 0; is < nrs->Nscalar; ++is){
-            nrs->cds->S[id + is * nrs->fieldOffset] = buffer[start + n + (4 + is) * nElem * mesh->Np];
+            nrs->cds->S[id + is * nrs->fieldOffset] = buffer[start + iid + (4 + is) * nElem * mesh->Np];
           }
         }
       }
@@ -173,14 +183,53 @@ void unpackBuf(nrs_t* nrs)
 
 void UDF_ExecuteStep(nrs_t *nrs, dfloat time, int tstep)
 {
+  auto * mesh = nrs->meshV;
+
   recvBuf(nrs);
 
   // do whatever work is possible without having the results here...
   MPI_Waitall(requests.size(), requests.data(), MPI_STATUSES_IGNORE);
 
   unpackBuf(nrs);
+  
+  nrs->o_U.copyFrom(nrs->U);
+  nrs->o_P.copyFrom(nrs->P);
+  if(nrs->cds){
+    nrs->cds->o_S.copyFrom(nrs->cds->S);
+  }
 
-  nek::ocopyToNek(time, tstep);
+  // get information about timestep, time from other session
+  dfloat otherTime;
+  dlong othertstep;
+  MPI_Bcast(&otherTime, 1, MPI_DFLOAT, 0, platform->comm.mpiCommParent);
+  MPI_Bcast(&othertstep, 1, MPI_DLONG, 0, platform->comm.mpiCommParent);
+
+  // do check sum on fields...
+  auto metrics = [&](std::string name, dfloat* a){
+    dfloat lmax = -std::numeric_limits<dfloat>::max();
+    dfloat lmin = std::numeric_limits<dfloat>::max();
+    dfloat lsum = 0.0;
+    for(int i = 0; i < mesh->Nlocal; ++i){
+      lmax = std::max(lmax, a[i]);
+      lmin = std::min(lmin, a[i]);
+      lsum += a[i];
+    }
+    std::cout << "max/min/sum " << name << " "
+      << lmax << "/"
+      << lmin << "/"
+      << lsum << "\n";
+  };
+
+  metrics("vx", nrs->U + 0 * nrs->fieldOffset);
+  metrics("vy", nrs->U + 1 * nrs->fieldOffset);
+  metrics("vz", nrs->U + 2 * nrs->fieldOffset);
+  metrics("p", nrs->P);
+  if(nrs->cds){
+    for(int is = 0; is < nrs->Nscalar; ++is){
+      metrics("s" + std::to_string(is), nrs->cds->S + is * nrs->fieldOffset);
+    }
+  }
+
+  nek::ocopyToNek(otherTime, othertstep);
   nek::userchk();
-
 }
