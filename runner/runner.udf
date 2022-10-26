@@ -21,6 +21,12 @@ occa::kernel dpdxKernel;
 occa::kernel exactUVWPKernel; 
 occa::kernel userMeshVelocityKernel;
 occa::memory o_x0, o_y0, o_z0;
+static std::map<dlong, std::vector<dlong>> receivingRankToElements;
+static std::map<dlong, dlong> bufferStart; // in terms of elements
+static std::vector<MPI_Request> requests;
+static MPI_Comm receivingCommunicator;
+static std::vector<dfloat> buffer;
+static dfloat numFields;
 
 void userq(nrs_t *nrs, dfloat time, occa::memory o_S, occa::memory o_FS)
 {
@@ -82,12 +88,134 @@ void UDF_Setup0(MPI_Comm comm, setupAide &options)
 
 void UDF_Setup(nrs_t *nrs)
 {
+  const auto tStart = MPI_Wtime();
   mesh_t *mesh = nrs->meshV;
   udf.sEqnSource = &userq;
   if(platform->options.compareArgs("MOVING MESH", std::string("TRUE"))) {
     o_x0 = platform->device.malloc(mesh->Nlocal, sizeof(dfloat), mesh->o_x);
     o_y0 = platform->device.malloc(mesh->Nlocal, sizeof(dfloat), mesh->o_y);
     o_z0 = platform->device.malloc(mesh->Nlocal, sizeof(dfloat), mesh->o_z);
+  }
+
+  MPI_Group parentGroup; // group associated with parent communicator
+  MPI_Group sendingGroup; // group associated with my communicator
+  MPI_Group receivingGroup; // group associated with other communicator
+
+  int rootParent = 0;
+  int rootSending = -1; // relative to parent
+  int rootReceiving = -1; // relative to parent
+
+  int parentRank;
+  MPI_Comm_rank(platform->comm.mpiCommParent, &parentRank);
+
+  MPI_Comm_group(platform->comm.mpiComm, &sendingGroup);
+  MPI_Comm_group(platform->comm.mpiCommParent, &parentGroup);
+
+  MPI_Group_difference(parentGroup, sendingGroup, &receivingGroup);
+
+  MPI_Comm_create(platform->comm.mpiCommParent, receivingGroup, &receivingCommunicator);
+
+  if(platform->comm.mpiRank == 0){
+    MPI_Comm_rank(platform->comm.mpiCommParent, &rootSending);
+  }
+
+  MPI_Allreduce(MPI_IN_PLACE, &rootReceiving, 1, MPI_INT, MPI_MAX, platform->comm.mpiCommParent);
+  MPI_Allreduce(MPI_IN_PLACE, &rootSending, 1, MPI_INT, MPI_MAX, platform->comm.mpiCommParent);
+
+  auto * mesh = nrs->meshV;
+  auto numGlobalElements = mesh->Nelements;
+  MPI_Allreduce(MPI_IN_PLACE, &numGlobalElements, 1, MPI_DLONG, MPI_SUM, platform->comm.mpiComm);
+  
+  // TODO: not scalable in terms of memory
+  const auto INVALID = -std::numeric_limits<dlong>::max();
+  std::vector<dlong> globalElements(numGlobalElements, INVALID);
+  std::vector<dlong> myGlobalElements(mesh->Nelements, INVALID);
+  std::map<dlong, dlong> globalToLocal;
+  for(int e = 0; e < mesh->Nelements; ++e){
+    auto ge = nek::lglel(e);
+    globalToLocal[ge] = e;
+    myGlobalElements[e] = ge;
+  }
+
+  // receive from other session
+  MPI_Bcast(globalElements.data(), numGlobalElements, MPI_DLONG, rootReceiving, platform->comm.mpiCommParent);
+
+  // determine which ranks I need to send to based on matching global elements
+  for(auto&& eg : myGlobalElements){
+    const auto receivingRank = globalElements[eg];
+    receivingRankToElements[receivingRank].push_back(globalToLocal[eg]);
+  }
+
+  std::fill(globalElements.begin(), globalElements.end(), INVALID);
+
+  for(auto && eg : myGlobalElements){
+    globalElement[eg] = parentRank;
+  }
+
+  MPI_Reduce(MPI_IN_PLACE, globalElements.data(), numGlobalElements, MPI_DLONG, MPI_MAX, 0, platform->comm.mpiComm);
+
+  // send to other session
+  MPI_Bcast(globalElements.data(), numGlobalElements, MPI_DLONG, rootSending, platform->comm.mpiCommParent);
+
+  // determine the starting index for each rank
+  dlong bufferStart = 0;
+  for(auto&& [rank, elements] : receivingRankToElements){
+    bufferStart[rank] = bufferStart;
+    bufferStart += elements.size();
+  }
+
+  requests.resize(receivingRankToElements.size());
+
+  numFields = nrs->NVfields nrs->Nscalar + 1; // velocity, pressure, and scalars
+
+  buffer.resize(numFields * bufferStart * mesh->Np);
+
+  if(platform->comm.mpiRank == 0){
+    std::cout << "udf_setup took " << MPI_Wtime() - tStart << " seconds" << std::endl;
+  }
+}
+
+void packBuf(nrs_t* nrs)
+{
+  auto * mesh = nrs->meshV;
+  for(auto&& [rank, elements] : receivingRankToElements){
+    auto start = numFields * mesh->Np * bufferStart[rank];
+    const auto nElem = elements.size();
+    for(auto&& e : elements){
+      for(int n = 0; n < mesh->Np; ++n){
+        const auto id = e * mesh->Np + n;
+        buffer[start + n + 0 * nElem * mesh->Np] = nrs->U[id + 0 * nrs->fieldOffset];
+        buffer[start + n + 1 * nElem * mesh->Np] = nrs->U[id + 1 * nrs->fieldOffset];
+        buffer[start + n + 2 * nElem * mesh->Np] = nrs->U[id + 2 * nrs->fieldOffset];
+        buffer[start + n + 3 * nElem * mesh->Np] = nrs->P[id];
+        if(nrs->cds){
+          for(int is = 0; is < nrs->Nscalar; ++is){
+            buffer[start + n + (4 + is) * nElem * mesh->Np] = nrs->cds->S[id + is * nrs->fieldOffset];
+          }
+        }
+      }
+    }
+  }
+}
+
+void sendBuf(nrs_t* nrs)
+{
+  int parentRank;
+  MPI_Comm_rank(platform->comm.mpiCommParent, &parentRank);
+  auto * mesh = nrs->meshV;
+
+  size_t ctr = 0;
+  for(auto&& [rank, elements] : receivingRankToElements){
+    auto start = numFields * mesh->Np * bufferStart[rank];
+    auto count = numFields * mesh->Np * elements.size();
+    MPI_Isend(
+      (void*)(buffer.data() + start),
+      count * sizeof(dfloat),
+      MPI_UNSIGNED_CHAR,
+      rank,
+      parentRank, // use sending rank as tag
+      platform->comm.mpiCommParent,
+      &requests[ctr++]);
   }
 }
 
@@ -121,36 +249,12 @@ void UDF_ExecuteStep(nrs_t *nrs, dfloat time, int tstep)
   if (send && firstSend) {
     firstSend = false;
     // communicate simulation results with coupled session, if applicable
-    [&](){
-      if(!nrs->multiSession) return;
-      if(platform->comm.mpiCommSize > 1) return;
-      nrs->o_U.copyTo(nrs->U);
+    if(!nrs->multiSession) return;
+    nrs->o_U.copyTo(nrs->U);
+    nrs->o_P.copyTo(nrs->P);
+    nrs->cds->o_S.copyTo(nrs->cds->S);
 
-      // field offsets may differ between the simulations, so must ensure
-      // that buffer is appropriately sized
-      std::vector<dfloat> U(nrs->NVfields * mesh->Nlocal);
-      for(int i = 0; i < mesh->Nlocal; ++i){
-        U[i + 0 * mesh->Nlocal] = nrs->U[i + 0 * nrs->fieldOffset];
-        U[i + 1 * mesh->Nlocal] = nrs->U[i + 1 * nrs->fieldOffset];
-        U[i + 2 * mesh->Nlocal] = nrs->U[i + 2 * nrs->fieldOffset];
-      }
-      
-      // send to the other rank
-      int globRank;
-      MPI_Comm_rank(platform->comm.mpiCommParent, &globRank);
-      int otherRank = (globRank + 1) % 2;
-
-      MPI_Request request;
-      MPI_Isend((void*) U.data(),
-        U.size() * sizeof(dfloat),
-        MPI_UNSIGNED_CHAR, 
-        otherRank,
-        0,
-        platform->comm.mpiCommParent,
-        &request);
-      
-      MPI_Wait(&request, MPI_STATUS_IGNORE);
-
-    }();
+    packBuf(nrs);
+    sendBuf(nrs);
   }
 }
