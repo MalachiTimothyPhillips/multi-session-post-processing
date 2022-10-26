@@ -119,7 +119,6 @@ void UDF_Setup(nrs_t *nrs)
   }
 
   numFields = nrs->NVfields + nrs->Nscalar + 1; // velocity, pressure, and scalars
-  std::cout << "numFields = " << numFields << "\n";
 
   buffer.resize(start*mesh->Np*numFields);
   requests.resize(sendingRankToElements.size());
@@ -139,7 +138,6 @@ void recvBuf(nrs_t* nrs)
 
   size_t ctr = 0;
   for(auto&& [rank, elements] : sendingRankToElements){
-    std::cout << "Calling recv from " << parentRank << " for sender " << rank << "\n";
     auto start = numFields * mesh->Np * bufferStart.at(rank);
     auto count = numFields * mesh->Np * elements.size();
     MPI_Irecv(
@@ -160,10 +158,8 @@ void unpackBuf(nrs_t* nrs)
   for(auto&& [rank, elements] : sendingRankToElements){
     auto eStart = bufferStart.at(rank);
     auto start = numFields * mesh->Np * eStart;
-    //std::cout << "start = " << start << "\n";
     const auto nElem = elements.size();
     for(auto&& e : elements){
-      //std::cout << "e = " << e << "\n";
       for(int n = 0; n < mesh->Np; ++n){
         const auto id = e * mesh->Np + n;
         const auto iid = (e-eStart) * mesh->Np + n;
@@ -214,10 +210,17 @@ void UDF_ExecuteStep(nrs_t *nrs, dfloat time, int tstep)
       lmin = std::min(lmin, a[i]);
       lsum += a[i];
     }
-    std::cout << "max/min/sum " << name << " "
-      << lmax << "/"
-      << lmin << "/"
-      << lsum << "\n";
+
+    MPI_Allreduce(MPI_IN_PLACE, &lmax, 1, MPI_DFLOAT, MPI_MAX, platform->comm.mpiComm);
+    MPI_Allreduce(MPI_IN_PLACE, &lmin, 1, MPI_DFLOAT, MPI_MIN, platform->comm.mpiComm);
+    MPI_Allreduce(MPI_IN_PLACE, &lsum, 1, MPI_DFLOAT, MPI_SUM, platform->comm.mpiComm);
+
+    if(platform->comm.mpiRank == 0){
+      std::cout << "max/min/sum " << name << " "
+        << lmax << "/"
+        << lmin << "/"
+        << lsum << "\n";
+    }
   };
 
   metrics("vx", nrs->U + 0 * nrs->fieldOffset);
